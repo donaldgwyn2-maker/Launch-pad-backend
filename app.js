@@ -1,11 +1,20 @@
 const express = require("express");
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const sgMail = require("@sendgrid/mail");
+sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 const cors = require("cors");
 const mongoose = require("mongoose");
 require("dotenv").config();
 
 const app = express();
 app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
-app.use(express.json({ limit: "10mb" }));
+app.use((req, res, next) => {
+  if (req.originalUrl === '/api/webhook') {
+    express.raw({ type: 'application/json' })(req, res, next);
+  } else {
+    express.json({ limit: "10mb" })(req, res, next);
+  }
+});
 
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log("✅ MongoDB connected"))
@@ -144,4 +153,104 @@ app.get("/api/admin/submissions", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 10000;
+// ══════════════════════════════════════════
+// STRIPE WEBHOOK — AUTO KIT DELIVERY
+// ══════════════════════════════════════════
+app.post('/api/webhook', async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('Webhook signature failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const customerEmail = session.customer_details?.email;
+    const amountPaid = session.amount_total;
+
+    console.log(`✅ Payment received: ${customerEmail} — $${amountPaid/100}`);
+
+    try {
+      // Find their submission by email
+      const submission = await Submission.findOne({ 
+        email: customerEmail 
+      }).sort({ createdAt: -1 });
+
+      if (!submission) {
+        console.log('No submission found for:', customerEmail);
+        return res.json({ received: true });
+      }
+
+      // Determine tier from amount paid
+      let tier = 'launch-map';
+      if (amountPaid >= 99700) tier = 'agency';
+      else if (amountPaid >= 99700) tier = 'bundle';
+      else if (amountPaid >= 59700) tier = 'ios-full';
+      else if (amountPaid >= 19700) tier = 'launch-map';
+
+      // Update submission status
+      await Submission.findByIdAndUpdate(submission._id, {
+        status: 'paid',
+        tier: tier
+      });
+
+      // Generate kit
+      const scores = calculateScores(submission);
+      const wrapperConfig = generateWrapperConfig(submission);
+      const checklist = generateStoreChecklist(submission, scores);
+
+      // Send kit email
+      const kitEmail = {
+        to: customerEmail,
+        from: {
+          email: process.env.FROM_EMAIL,
+          name: process.env.FROM_NAME || 'LaunchPad Pro'
+        },
+        subject: '🚀 Your LaunchPad Pro Kit is Ready!',
+        html: `
+          <div style="font-family:sans-serif;max-width:600px;margin:0 auto;background:#08060A;color:#fff;padding:40px;border-radius:16px;">
+            <h1 style="color:#C9991A;font-size:28px;">Your Launch Kit is Ready 🔥</h1>
+            <p style="color:#ccc;">Payment confirmed. Here's everything you need to launch.</p>
+            
+            <div style="background:#1a1a2e;padding:24px;border-radius:12px;margin:24px 0;">
+              <h2 style="color:#C9991A;">📊 Your LaunchScore: ${scores.launchScore}/100</h2>
+              <p>Apple Store Readiness: <strong style="color:#C9991A;">${scores.appleScore}/100</strong></p>
+              <p>Google Play Readiness: <strong style="color:#C9991A;">${scores.googleScore}/100</strong></p>
+            </div>
+
+            <div style="background:#1a1a2e;padding:24px;border-radius:12px;margin:24px 0;">
+              <h2 style="color:#C9991A;">⚙️ Wrapper Config</h2>
+              <pre style="color:#E8431A;font-size:12px;overflow-x:auto;">${JSON.stringify(wrapperConfig, null, 2)}</pre>
+            </div>
+
+            <div style="background:#1a1a2e;padding:24px;border-radius:12px;margin:24px 0;">
+              <h2 style="color:#C9991A;">✅ Store Submission Checklist</h2>
+              <pre style="color:#ccc;font-size:12px;">${JSON.stringify(checklist, null, 2)}</pre>
+            </div>
+
+            <p style="color:#888;font-size:12px;margin-top:32px;">
+              LaunchPad Pro OS · Salisbury, NC · Reply to this email for support
+            </p>
+          </div>
+        `
+      };
+
+      await sgMail.send(kitEmail);
+      console.log(`📧 Kit emailed to: ${customerEmail}`);
+
+    } catch (err) {
+      console.error('Kit delivery error:', err);
+    }
+  }
+
+  res.json({ received: true });
+});
 app.listen(PORT, () => console.log(`🚀 LaunchPad OS v7.0 — All 7 engines running on port ${PORT}`));
